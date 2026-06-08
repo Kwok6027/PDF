@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""
+dotnet_to_il.py - disassemble a .NET (managed) DLL to CIL/IL using dnfile + dncil.
+
+Pure pip, no .NET SDK, no capstone:
+    pip install dnfile dncil
+
+It asks you for the FOLDER PATH and the FILE NAME (or pass them as arguments),
+then writes the IL of every method to "<dllname>.il.txt" in the current folder.
+
+NOTE: this produces IL (the instructions the CLR runs), NOT reconstructed C#.
+Recovering C# needs a .NET-based engine (the .NET SDK + ilspycmd route).
+
+Usage:
+    python dotnet_to_il.py
+        -> prompts:  Folder path containing the DLL:
+                     DLL file name (leave blank to do every .dll in the folder):
+
+    python dotnet_to_il.py "C:\\path\\to\\folder" PandoraPricer.dll
+    python dotnet_to_il.py "C:\\path\\to\\folder"          # all *.dll in folder
+"""
+
+import glob
+import os
+import sys
+
+
+def get_inputs():
+    """Return (folder, filename). Use argv if given, else prompt."""
+    if len(sys.argv) >= 3:
+        return sys.argv[1], sys.argv[2]
+    if len(sys.argv) == 2:
+        return sys.argv[1], ""
+    folder = input("Folder path containing the DLL: ").strip().strip('"').strip("'")
+    name = input("DLL file name (leave blank to do every .dll in the folder): ").strip().strip('"').strip("'")
+    return folder, name
+
+
+def _make_reader():
+    """Build the dncil reader class (imported lazily so the missing-lib message fires first)."""
+    from dncil.cil.body.reader import CilMethodBodyReaderBase
+
+    class DnfileReader(CilMethodBodyReaderBase):
+        def __init__(self, pe, rva):
+            self.pe = pe
+            self.offset = pe.get_offset_from_rva(rva)
+
+        def read(self, n):
+            data = self.pe.get_data(self.pe.get_rva_from_offset(self.offset), n)
+            self.offset += n
+            return data
+
+        def tell(self):
+            return self.offset
+
+        def seek(self, offset):
+            self.offset = offset
+            return self.offset
+
+    return DnfileReader
+
+
+def disassemble_one(path, outdir):
+    import dnfile
+    from dncil.cil.body import CilMethodBody
+
+    Reader = _make_reader()
+
+    try:
+        pe = dnfile.dnPE(path)
+    except Exception as e:                       # noqa: BLE001
+        print("  [skip] dnfile could not parse %s: %s" % (os.path.basename(path), e))
+        return
+
+    if not getattr(pe, "net", None):
+        print("  [skip] %s is NOT a .NET assembly (it looks native)."
+              % os.path.basename(path))
+        print("         Use the native route (dumpbin / iced-x86 / Ghidra) for that one.")
+        return
+
+    md = getattr(pe.net.mdtables, "MethodDef", None)
+    if md is None:
+        print("  [skip] no MethodDef metadata table in %s" % os.path.basename(path))
+        return
+    rows = md.rows if hasattr(md, "rows") else list(md)
+
+    def resolve_user_string(operand):
+        # Turn a #US (0x70) string token into its text; otherwise None.
+        try:
+            val = operand.value
+            if (val >> 24) != 0x70:
+                return None
+            us = pe.net.user_strings.get_us(val & 0x00FFFFFF)
+            return us.value if us is not None else None
+        except Exception:                        # noqa: BLE001
+            return None
+
+    def fmt_operand(operand):
+        if operand is None:
+            return ""
+        s = resolve_user_string(operand)
+        if s is not None:
+            return '"%s"' % s
+        if isinstance(operand, int):
+            return hex(operand)
+        if hasattr(operand, "value") and isinstance(operand.value, int):
+            return "token(0x%08X)" % operand.value
+        return str(operand)
+
+    out_path = os.path.join(outdir, os.path.basename(path) + ".il.txt")
+    bodies = 0
+    total = 0
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("// IL disassembly of %s\n" % os.path.basename(path))
+        f.write("// via dnfile + dncil (pure Python, no .NET SDK, no capstone).\n")
+        f.write("// This is CIL/IL - the instructions the runtime executes - not C#.\n\n")
+        for i, row in enumerate(rows):
+            total += 1
+            name = str(getattr(row, "Name", "method_%d" % i))
+            rva = int(getattr(row, "Rva", 0) or 0)
+            token = 0x06000000 | (i + 1)          # MethodDef metadata token
+            if rva == 0:
+                f.write("// %s  (token 0x%08X) - no IL body (abstract/interface/extern)\n\n"
+                        % (name, token))
+                continue
+            try:
+                body = CilMethodBody(Reader(pe, rva))
+            except Exception as e:                # noqa: BLE001
+                f.write("// %s  (token 0x%08X) - could not read body: %s\n\n"
+                        % (name, token, e))
+                continue
+            f.write("// ===== %s  (token 0x%08X) =====\n" % (name, token))
+            for insn in body.instructions:
+                f.write("    IL_%04X:  %-12s %s\n"
+                        % (insn.offset, insn.mnemonic, fmt_operand(insn.operand)))
+            f.write("\n")
+            bodies += 1
+
+    print("  OK  %s  ->  %s   (%d of %d methods had IL bodies)"
+          % (os.path.basename(path), out_path, bodies, total))
+
+
+def main():
+    # Fail fast (and before prompting) if the libraries aren't installed.
+    try:
+        import dnfile                                  # noqa: F401
+        from dncil.cil.body import CilMethodBody       # noqa: F401
+    except ImportError:
+        print("Required libraries are missing. Install them (pure pip - no SDK, no capstone):")
+        print("    pip install dnfile dncil")
+        return
+
+    folder, name = get_inputs()
+    folder = os.path.expanduser(folder)
+    if not os.path.isdir(folder):
+        print("Folder not found:", folder)
+        return
+
+    outdir = os.getcwd()   # write next to where you run the script (input folder may be read-only)
+
+    if name:
+        path = os.path.join(folder, name)
+        if not os.path.isfile(path) and os.path.isfile(path + ".dll"):
+            path += ".dll"                              # allow leaving off the extension
+        if not os.path.isfile(path):
+            print("File not found:", path)
+            return
+        print("Disassembling:", path)
+        disassemble_one(path, outdir)
+    else:
+        dlls = sorted(glob.glob(os.path.join(folder, "*.dll")))
+        if not dlls:
+            print("No .dll files found in", folder)
+            return
+        print("Found %d .dll file(s); processing all of them..." % len(dlls))
+        for p in dlls:
+            disassemble_one(p, outdir)
+
+    print("\nDone. IL file(s) written to:", outdir)
+
+
+if __name__ == "__main__":
+    main()
