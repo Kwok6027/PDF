@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+# =====================================================================
+# find_symbol.py  --  locate which DLL actually DEFINES a symbol (e.g. getVol),
+# by reading export/import tables. No decompiling needed -- runs in seconds.
+#
+# Needs pefile (you already have it). If not:  pip install pefile
+#
+# RUN (point it at the folder that holds all the Pandora*.dll files):
+#   python find_symbol.py  "C:\path\to\dll\folder"  getVol HaganBBF asymptoticNormalVolatility
+#
+# Defaults: current folder; search terms getVol / HaganBBF / asymptotic.
+# (If named .txt, rename to .py or run:  python find_symbol.py.txt  <folder>  getVol HaganBBF )
+# =====================================================================
+
+import sys
+import os
+
+try:
+    import pefile
+except ImportError:
+    print("This needs pefile:  pip install pefile")
+    sys.exit(1)
+
+# the DLL whose imports we especially care about (the one that calls getVol)
+PRIMARY = "pandoraasymptoticformula.dll"
+
+
+def main():
+    folder = sys.argv[1] if len(sys.argv) > 1 else "."
+    terms = [t.lower() for t in (sys.argv[2:] or ["getvol", "haganbbf", "asymptotic"])]
+    if not os.path.isdir(folder):
+        print("Not a folder:", folder)
+        return 1
+    dlls = [f for f in os.listdir(folder) if f.lower().endswith(".dll")]
+    if not dlls:
+        print("No .dll files found in", folder)
+        return 1
+
+    print("Searching %d DLLs for: %s" % (len(dlls), ", ".join(terms)))
+    print("=" * 70)
+
+    exporters = {}    # dll -> [matching export names]
+    importers = {}    # dll -> [(source_dll, matching import name)]
+    primary_sources = set()
+
+    for f in sorted(dlls):
+        path = os.path.join(folder, f)
+        try:
+            pe = pefile.PE(path, fast_load=True)
+            pe.parse_data_directories(directories=[
+                pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_EXPORT'],
+                pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT'],
+            ])
+        except Exception as e:
+            print("  (skip %s: %s)" % (f, e))
+            continue
+
+        # EXPORTS  -- the DLL that DEFINES the symbol
+        exp_dir = getattr(pe, "DIRECTORY_ENTRY_EXPORT", None)
+        if exp_dir:
+            for exp in exp_dir.symbols:
+                nm = exp.name.decode("latin1", "replace") if exp.name else ""
+                if nm and any(t in nm.lower() for t in terms):
+                    exporters.setdefault(f, []).append(nm)
+
+        # IMPORTS  -- who CALLS the symbol, and from which DLL
+        imp_dir = getattr(pe, "DIRECTORY_ENTRY_IMPORT", None)
+        if imp_dir:
+            for entry in imp_dir:
+                src = entry.dll.decode("latin1", "replace") if entry.dll else "?"
+                if f.lower() == PRIMARY and src.lower().startswith("pandora"):
+                    primary_sources.add(src)
+                for imp in entry.imports:
+                    nm = imp.name.decode("latin1", "replace") if imp.name else ""
+                    if nm and any(t in nm.lower() for t in terms):
+                        importers.setdefault(f, []).append((src, nm))
+        try:
+            pe.close()
+        except Exception:
+            pass
+
+    print("\n>>> [A] EXPORTED BY  -- the DLL that DEFINES the symbol (DECOMPILE THIS ONE):\n")
+    if not exporters:
+        print("   (none found by name -- it may be exported by ordinal only; see [C] below)")
+    for dll, syms in exporters.items():
+        print("   *", dll)
+        for s in syms[:10]:
+            print("        ", s[:110])
+
+    print("\n>>> [B] IMPORTED BY  -- who calls it, and from which DLL:\n")
+    if not importers:
+        print("   (no matching imports found by name)")
+    for dll, lst in importers.items():
+        srcs = sorted(set(src for src, _ in lst))
+        print("   *", dll, " <- from:", ", ".join(srcs))
+
+    print("\n>>> [C] %s depends on these Pandora DLLs (candidates if [A] is empty):\n" % PRIMARY)
+    if primary_sources:
+        for s in sorted(primary_sources):
+            print("   -", s)
+    else:
+        print("   (could not read its import table, or it imports nothing from Pandora DLLs)")
+
+    print("\n" + "=" * 70)
+    print("WHAT TO DO")
+    print("=" * 70)
+    if exporters:
+        names = ", ".join(exporters.keys())
+        print("  Decompile the DLL in [A] (%s) with the fixed tool, then run" % names)
+        print("  check_decompile.py on it -- getVol should be DEFINED there.")
+    elif primary_sources:
+        print("  No named export matched, but the smile lives in one of the DLLs in [C].")
+        print("  Decompile those (smallest first) and run check_decompile.py until getVol is DEFINED.")
+    else:
+        print("  Couldn't pin it from the tables. Send me the export lists this printed and")
+        print("  I'll tell you which DLL to decompile.")
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
