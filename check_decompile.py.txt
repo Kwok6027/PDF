@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+# =====================================================================
+# check_decompile.py  --  run this on the decompiled .c BEFORE sending it.
+#
+# It verifies the file actually contains the formulas/functions needed to
+# replicate the SABR vanilla-swaption valuation (the building block of the
+# cancellation), and tells you in plain English: send it / send it but heads-up /
+# re-run.
+#
+# HOW TO RUN  (Windows or Mac/Linux, Python 3, no extra installs):
+#     python check_decompile.py PandoraAsymptoticFormula.dll.decompiled.with_values.inlined.c
+#
+# (If this file is named .txt, either rename it to .py or just run:
+#     python check_decompile.py.txt  PandoraAsymptoticFormula.dll.decompiled.with_values.inlined.c )
+# =====================================================================
+
+import re
+import sys
+import os
+
+# ---- functions that MUST be DEFINED (with a real body) -- the SABR smile ----
+KEYSTONE = [
+    "HaganBBF_asymptoticFormula::getVol",                 # the lognormal SABR smile (vol at a strike)
+    "HaganBBF_asymptoticFormula::asymptoticNormalVolatility",  # the normal-vol variant
+    "HaganBBF_asymptoticFormula::getVolATM",              # the ATM helper
+]
+
+# ---- helpful if DEFINED -- inversion, wrappers, CEV vol ----
+SUPPORT = [
+    "AsymptoticFormula::getImpliedSigma_CF",              # alpha-from-vol root-find
+    "AsymptoticFormula::getHaganBBFLognormalVolatility",  # wrapper
+    "AsymptoticFormula::getHaganBBFNormalVolatility",     # wrapper
+    "CEVAlphaMatrix::GetATMVolFromAlpha",                 # CEV ATM vol (lives in the vol DLL)
+]
+
+# ---- standard math expected to be EXTERNAL (I reimplement these) -- informational ----
+EXTERNAL_OK = ["RootFinder", "BracketingBrent", "Brent", "BlackScholes",
+               "ImpliedVolatility", "ComputeYearFraction", "YearFraction",
+               "NAG", "erf", "Normal", "cdf", "Gauss"]
+
+KEYWORDS = set((
+    "if else for while switch case do return sizeof typedef struct union enum const "
+    "static unsigned signed void int char long short float double bool goto break "
+    "continue default extern volatile register inline true false null"
+).split())
+
+# Ghidra pseudo-ops that look like calls but aren't real functions
+PSEUDO = re.compile(r'^(CONCAT|SUB|ZEXT|SEXT|CARRY|SCARRY|SBORROW|POPCOUNT|ABS|NAN|in_|unaff_|extraout_|__)', re.I)
+
+
+def match_delims(text, open_idx, op, cl, max_span=None):
+    """Return index of the delimiter matching the one at open_idx (naive; good enough for bodies).
+    max_span caps how far we search, so a stray/garbled delimiter can't make us run away."""
+    depth = 0
+    i = open_idx
+    n = len(text)
+    stop = n if max_span is None else min(n, open_idx + max_span)
+    while i < stop:
+        c = text[i]
+        if c == op:
+            depth += 1
+        elif c == cl:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def classify(text, s, e):
+    """Classify the name occurrence at [s,e): ('def', body_open_idx) / ('call',None) / ('comment',None) / ('skip'/'other', None)."""
+    nxt = text[e] if e < len(text) else ''
+    if nxt.isalnum() or nxt == '_':
+        return ('skip', None)                       # part of a longer identifier
+    ls = text.rfind('\n', 0, s) + 1
+    if '//' in text[ls:s]:
+        return ('comment', None)                    # the "// addr name" annotation line
+    # previous non-space char
+    j = s - 1
+    while j >= 0 and text[j].isspace():
+        j -= 1
+    prev = text[j] if j >= 0 else ''
+    # find '(' after the name (allow line-wrapped signatures)
+    k = e
+    while k < len(text) and text[k].isspace():
+        k += 1
+    if k >= len(text) or text[k] != '(':
+        return ('other', None)
+    if prev == '=':
+        return ('call', None)                       # right-hand side of an assignment
+    cp = match_delims(text, k, '(', ')', max_span=3000)   # param lists/args are short; cap to avoid runaway
+    if cp == -1:
+        return ('other', None)
+    m = cp + 1
+    while m < len(text) and text[m].isspace():
+        m += 1
+    if m < len(text) and text[m] == '{':
+        return ('def', m)                           # signature followed by a body
+    return ('call', None)
+
+
+def analyze(text, name):
+    """Return (list_of_body_open_indices, n_calls) for a function name."""
+    defs = []
+    calls = 0
+    for mo in re.finditer(re.escape(name), text):
+        kind, info = classify(text, mo.start(), mo.end())
+        if kind == 'def':
+            defs.append(info)
+        elif kind == 'call':
+            calls += 1
+    return defs, calls
+
+
+def body_of(text, open_idx):
+    end = match_delims(text, open_idx, '{', '}', max_span=400000)
+    return text[open_idx:(end + 1 if end != -1 else open_idx + 4000)]
+
+
+def callees(body, self_name):
+    out = []
+    seen = set()
+    for mo in re.finditer(r'([A-Za-z_][A-Za-z0-9_:~]*)\s*\(', body):
+        nm = mo.group(1)
+        base = nm.split('::')[-1]
+        if base in KEYWORDS or nm in KEYWORDS:
+            continue
+        if PSEUDO.match(base) or PSEUDO.match(nm):
+            continue
+        if nm == self_name:
+            continue
+        if nm in seen:
+            continue
+        seen.add(nm)
+        out.append(nm)
+    return out
+
+
+def arith_counts(body):
+    return {op: len(re.findall(r'\b' + op + r'\s*\(', body)) for op in ("pow", "sqrt", "log", "exp")}
+
+
+def main():
+    path = sys.argv[1] if len(sys.argv) > 1 else \
+        "PandoraAsymptoticFormula.dll.decompiled.with_values.inlined.c"
+    if not os.path.isfile(path):
+        print("ERROR: file not found:", path)
+        print("Usage: python check_decompile.py <decompiled .c file>")
+        return 1
+
+    text = open(path, "r", encoding="utf-8", errors="replace").read()
+    line = "=" * 72
+
+    print(line)
+    print("Checking:", os.path.basename(path))
+    print("Size: %.1f KB" % (len(text) / 1024.0))
+    nblocks = len(re.findall(r'(?m)^//\s+[0-9A-Fa-f]{5,}\s+\S', text))
+    print("Function blocks the tool emitted:",
+          nblocks if nblocks else "(marker not found - non-standard format, results still valid)")
+    print(line)
+
+    smile_ok = False          # a smile body (getVol or normal) present WITH arithmetic
+    smile_name = None
+    smile_missing = []
+
+    print("\n[1] KEYSTONE  -- the SABR smile (these MUST be DEFINED with a body):\n")
+    for name in KEYSTONE:
+        defs, calls = analyze(text, name)
+        short = name.split("::")[-1]
+        if defs:
+            body = body_of(text, defs[0])
+            ac = arith_counts(body)
+            has_math = sum(ac.values()) > 0
+            print("  [OK]      DEFINED   %-42s body=%4d lines  calls=%d"
+                  % (short, body.count('\n'), calls))
+            print("            math in body: pow=%d sqrt=%d log=%d exp=%d   %s"
+                  % (ac["pow"], ac["sqrt"], ac["log"], ac["exp"],
+                     "<- real formula" if has_math else "<- WARNING: no math (stub/thunk?)"))
+            if has_math and short in ("getVol", "asymptoticNormalVolatility") and not smile_ok:
+                smile_ok = True
+                smile_name = short
+                # show a snippet
+                print("            --- first lines of %s body ---" % short)
+                for ln in body.splitlines()[1:13]:
+                    print("            |", ln[:88])
+                # which callees are still missing from this file?
+                for c in callees(body, name):
+                    if any(tag.lower() in c.lower() for tag in EXTERNAL_OK):
+                        continue
+                    cdefs, _ = analyze(text, c)
+                    if not cdefs:
+                        smile_missing.append(c)
+        else:
+            print("  [MISSING] not defined %-42s (appears only as %d call(s))" % (short, calls))
+
+    print("\n[2] SUPPORTING  -- inversion / wrappers / CEV vol (helpful if DEFINED):\n")
+    for name in SUPPORT:
+        defs, calls = analyze(text, name)
+        print("  [%s] %-46s defs=%d  calls=%d"
+              % ("OK" if defs else "--", name.split("::")[-1], len(defs), calls))
+
+    print("\n[3] DEEPER DEPENDENCIES  -- non-standard functions the smile calls but that are NOT in this file:\n")
+    if not smile_ok:
+        print("   (skipped - no smile body with arithmetic was found)")
+    elif not smile_missing:
+        print("   [OK] none - every non-standard function %s() calls is defined right here." % smile_name)
+    else:
+        print("   These are called by %s() but not defined in this file (I may still need them):" % smile_name)
+        for c in sorted(set(smile_missing)):
+            print("     -", c)
+        print("   (Standard math - RootFinder/Brent/BlackScholes/daycount/NAG - is filtered out; I reimplement those.)")
+
+    print("\n[4] STANDARD MATH LEAVES  (expected external & reimplementable - informational only):\n")
+    for name in EXTERNAL_OK:
+        defs, calls = analyze(text, name)
+        state = "DEFINED here" if defs else (("called %dx" % calls) if calls else "absent")
+        print("   %-20s : %s" % (name, state))
+
+    print("\n[5] SELF-CONTAINMENT  (only meaningful for the *.with_values.inlined.c file):\n")
+    has_tables = "DATA TABLES" in text
+    ndbl = len(re.findall(r'static const double\s+\w+\s*\[', text))
+    nptr = len(re.findall(r'static const unsigned long long\s+\w+\s*\[', text))
+    print("   embedded DATA TABLES block     : %s"
+          % ("yes" if has_tables else "no (this is probably the plain .decompiled.c, not the inlined one)"))
+    print("   embedded double arrays         : %d" % ndbl)
+    print("   embedded pointer/vtable arrays : %d" % nptr)
+
+    print("\n" + line)
+    print("VERDICT")
+    print(line)
+    if smile_ok and not smile_missing:
+        print("  PASS  -- the SABR smile (%s) is defined with real arithmetic, and every" % smile_name)
+        print("           non-standard function it calls is present in this file.")
+        print("           >>> Send this file. <<<")
+    elif smile_ok and smile_missing:
+        print("  PARTIAL -- the smile (%s) is defined, but it calls functions not in this" % smile_name)
+        print("           file (listed in section [3] above).")
+        print("           >>> Send this file anyway -- I'll confirm whether those callees")
+        print("               matter or are harmless. <<<")
+    else:
+        print("  INCOMPLETE -- no SABR smile body with arithmetic was found.")
+        print("           Most likely this file was made by the PRE-FIX tool (re-run with the")
+        print("           fixed tool), OR the recovery pass missed it.")
+        print("           >>> Send the file PLUS the *.ghidra.log so I can see what happened. <<<")
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
